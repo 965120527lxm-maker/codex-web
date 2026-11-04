@@ -1,3 +1,6 @@
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+
 type StubFunction = (...args: unknown[]) => unknown;
 type StubListener = (...args: unknown[]) => void;
 type StubMessagePort = {
@@ -39,7 +42,7 @@ type IpcMainBridgeState = {
       channel: string;
       args: unknown[];
     },
-  ) => void;
+  ) => boolean;
   handleRendererInvoke?: (
     channel: string,
     args: unknown[],
@@ -69,7 +72,9 @@ function getIpcMainBridgeState(): IpcMainBridgeState {
 }
 
 function log(method: string, args: unknown[]): void {
-  console.log(`[electron-main-stub] ${method}`, args);
+  if (process.env.CODEX_WEB_DEBUG_STUBS === "1") {
+    console.log(`[electron-main-stub] ${method}`, args);
+  }
 }
 
 function createDeepStub(pathLabel: string): StubFunction {
@@ -711,9 +716,13 @@ class Menu {
   }
 }
 
+let nextMenuCommandId = 1;
+
 class MenuItem {
+  accelerator?: string;
   checked?: boolean;
   click?: (...args: unknown[]) => unknown;
+  commandId: number = nextMenuCommandId++;
   enabled?: boolean;
   id?: string;
   label?: string;
@@ -728,20 +737,27 @@ class MenuItem {
     if (!options || typeof options !== "object") {
       return;
     }
+    this.accelerator = typeof options.accelerator === "string" ? options.accelerator : undefined;
     this.checked =
       typeof options.checked === "boolean" ? options.checked : undefined;
     this.click =
       typeof options.click === "function"
         ? (options.click as (...args: unknown[]) => unknown)
         : undefined;
-    this.enabled =
-      typeof options.enabled === "boolean" ? options.enabled : undefined;
+    this.enabled = typeof options.enabled === "boolean" ? options.enabled : true;
     this.id = typeof options.id === "string" ? options.id : undefined;
     this.label = typeof options.label === "string" ? options.label : undefined;
     this.role = typeof options.role === "string" ? options.role : undefined;
-    this.type = typeof options.type === "string" ? options.type : undefined;
-    this.visible =
-      typeof options.visible === "boolean" ? options.visible : undefined;
+    this.type = typeof options.type === "string" ? options.type : "normal";
+    this.visible = typeof options.visible === "boolean" ? options.visible : true;
+
+    if (!this.click && this.role) {
+      const role = this.role;
+      this.click = (...clickArgs: unknown[]): void => {
+        const sender = clickArgs[2] as StubWebContents | undefined;
+        sender?.send("codex-web:menu-role", role);
+      };
+    }
 
     const submenu = options.submenu;
     if (Array.isArray(submenu)) {
@@ -770,10 +786,78 @@ class Notification {
   }
 }
 
+const pendingWorkspaceDialogs = new Map<string, {
+  webContentsId: number;
+  resolve: (result: { canceled: boolean; filePaths: string[] }) => void;
+}>();
+
+const pendingMessageBoxes = new Map<string, {
+  webContentsId: number;
+  resolve: (result: { response: number }) => void;
+}>();
+
+
 const dialog = {
+  async showOpenDialog(...args: unknown[]): Promise<{ canceled: boolean; filePaths: string[] }> {
+    const window = args[0] instanceof BrowserWindow ? args[0] : BrowserWindow.getFocusedWindow();
+    const options = (args[0] instanceof BrowserWindow ? args[1] : args[0]) as { properties?: string[] } | undefined;
+    if (!window || !options?.properties?.includes("openDirectory")) {
+      return { canceled: true, filePaths: [] };
+    }
+    const webContentsId = window.webContents.id as number;
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingWorkspaceDialogs.delete(requestId);
+        resolve({ canceled: true, filePaths: [] });
+      }, 600_000);
+      pendingWorkspaceDialogs.set(requestId, { webContentsId, resolve: (result) => { clearTimeout(timer); resolve(result); } });
+      const sent = getIpcMainBridgeState().sendToRenderer?.(webContentsId, {
+        type: "ipc-main-event", channel: "codex-web:workspace-dialog-request", args: [requestId],
+      });
+      if (!sent) {
+        pendingWorkspaceDialogs.delete(requestId);
+        clearTimeout(timer);
+        resolve({ canceled: true, filePaths: [] });
+      }
+    });
+  },
   async showMessageBox(...args: unknown[]): Promise<{ response: number }> {
-    log("dialog.showMessageBox", args);
-    return { response: 0 };
+    const window = args[0] instanceof BrowserWindow ? args[0] : BrowserWindow.getFocusedWindow();
+    const options = (args[0] instanceof BrowserWindow ? args[1] : args[0]) as {
+      buttons?: string[];
+      cancelId?: number;
+      defaultId?: number;
+      detail?: string;
+      message?: string;
+      title?: string;
+    } | undefined;
+    const buttons = options?.buttons?.length ? options.buttons : ["OK"];
+    const cancelId = options?.cancelId ?? buttons.length - 1;
+    if (!window) return { response: cancelId };
+
+    const webContentsId = window.webContents.id as number;
+    const requestId = randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingMessageBoxes.delete(requestId);
+        resolve({ response: cancelId });
+      }, 600_000);
+      pendingMessageBoxes.set(requestId, {
+        webContentsId,
+        resolve: (result) => { clearTimeout(timer); resolve(result); },
+      });
+      const sent = getIpcMainBridgeState().sendToRenderer?.(webContentsId, {
+        type: "ipc-main-event",
+        channel: "codex-web:message-box-request",
+        args: [requestId, { ...options, buttons, cancelId }],
+      });
+      if (!sent) {
+        pendingMessageBoxes.delete(requestId);
+        clearTimeout(timer);
+        resolve({ response: cancelId });
+      }
+    });
   },
 };
 
@@ -784,6 +868,12 @@ const crashReporter = {
 };
 
 const net = {
+  // Electron's net module exposes this helper. The browser bridge does not
+  // have Electron's connectivity monitor, so report the host as online and
+  // let the actual WebSocket request determine reachability.
+  isOnline(): boolean {
+    return true;
+  },
   async fetch(input: string | URL, init?: RequestInit): Promise<Response> {
     // log("net.fetch", [input, init]);
     if (typeof globalThis.fetch === "function") {
@@ -818,6 +908,24 @@ const net = {
 
 const autoUpdater = createEmitterStub("autoUpdater");
 const ipcMain = createIpcMainStub();
+
+ipcMain.on("codex-web:workspace-dialog-result", (event, result) => {
+  const response = result as { requestId?: unknown; path?: unknown } | undefined;
+  if (typeof response?.requestId !== "string") return;
+  const pending = pendingWorkspaceDialogs.get(response.requestId);
+  if (!pending || (event as IpcMainEvent).sender.id !== pending.webContentsId) return;
+  pendingWorkspaceDialogs.delete(response.requestId);
+  const selected = typeof response.path === "string" && response.path.length > 0 ? response.path : null;
+  pending.resolve({ canceled: selected === null, filePaths: selected ? [selected] : [] });
+});
+ipcMain.on("codex-web:message-box-result", (event, result) => {
+  const response = result as { requestId?: unknown; response?: unknown } | undefined;
+  if (typeof response?.requestId !== "string" || typeof response.response !== "number") return;
+  const pending = pendingMessageBoxes.get(response.requestId);
+  if (!pending || (event as IpcMainEvent).sender.id !== pending.webContentsId) return;
+  pendingMessageBoxes.delete(response.requestId);
+  pending.resolve({ response: response.response });
+});
 const nativeTheme = {
   ...createEmitterStub("nativeTheme"),
   shouldUseDarkColors: false,
@@ -1071,6 +1179,18 @@ class MessageChannelMain {
   port2 = createMessagePortStub("MessageChannelMain.port2");
 }
 
+const shell = {
+  openExternal(url: string): Promise<void> {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return Promise.reject(new Error("Unsupported external URL protocol"));
+    }
+    return new Promise((resolve, reject) => {
+      execFile("/usr/bin/xdg-open", [url], (error) => error ? reject(error) : resolve());
+    });
+  },
+};
+
 const electronModule = new Proxy(
   {
     app,
@@ -1091,6 +1211,7 @@ const electronModule = new Proxy(
     protocol,
     screen,
     session,
+    shell,
     Tray,
     utilityProcess,
     WebContentsView,
@@ -1126,6 +1247,7 @@ export {
   protocol,
   screen,
   session,
+  shell,
   Tray,
   utilityProcess,
   WebContentsView,

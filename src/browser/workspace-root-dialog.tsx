@@ -70,15 +70,14 @@ function WorkspaceRootDialog({
   }, []);
 
   useEffect(() => {
-    function handleKeyDown(event: KeyboardEvent): void {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onClose(null);
-      }
-    }
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    const handleEscape = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      onClose(null);
+    };
+    window.addEventListener("keydown", handleEscape, true);
+    return () => window.removeEventListener("keydown", handleEscape, true);
   }, [onClose]);
 
   const selectedPath = userSelectedPath ?? directoryQuery.data?.directoryPath;
@@ -186,10 +185,10 @@ function WorkspaceRootDialog({
                     ].join(" ")}
                     id={TITLE_ID}
                   >
-                    Add remote project
+                    Select a local folder
                   </div>
                   <div className={["sr-only"].join(" ")} id={DESCRIPTION_ID}>
-                    Choose a folder on the Codex Web host to add as a project.
+                    Choose a folder on the computer running Codex Web.
                   </div>
                 </div>
               </div>
@@ -211,7 +210,7 @@ function WorkspaceRootDialog({
                     " ",
                   )}
                 >
-                  Select folder
+                  Double-click a folder to open it; select one and click Use folder.
                 </span>
                 <div
                   className={[
@@ -482,7 +481,7 @@ function WorkspaceRootDialog({
                   disabled={!selectedPath || isBusy}
                   type="submit"
                 >
-                  Add project
+                  Use folder
                 </button>
               </div>
             </div>
@@ -523,6 +522,11 @@ function ensureHost(): HTMLElement {
     element = document.createElement("div");
     element.id = DIALOG_ID;
     document.body.append(element);
+    // The picker is mounted outside the desktop dialog's DOM tree. Keep its
+    // pointer and focus events from dismissing the Create project dialog.
+    for (const eventName of ["pointerdown", "mousedown", "click", "focusin"]) {
+      element.addEventListener(eventName, (event) => event.stopPropagation());
+    }
   }
   return element;
 }

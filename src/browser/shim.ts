@@ -155,6 +155,73 @@ function unimplemented(method: string): never {
   throw new Error(`[electron-stub] ${method} is not implemented`);
 }
 
+type MessageBoxOptions = {
+  buttons?: string[];
+  cancelId?: number;
+  defaultId?: number;
+  detail?: string;
+  message?: string;
+  title?: string;
+};
+
+function openMessageBox(options: MessageBoxOptions): Promise<number> {
+  const buttons = options.buttons?.length ? options.buttons : ["OK"];
+  const cancelId = options.cancelId ?? buttons.length - 1;
+  return new Promise((resolve) => {
+    const dialog = document.createElement("dialog");
+    dialog.setAttribute("aria-label", options.title || options.message || "Message");
+    Object.assign(dialog.style, {
+      background: "var(--color-codex-background, #fff)",
+      border: "1px solid #9995",
+      borderRadius: "12px",
+      boxShadow: "0 12px 36px #0003",
+      color: "var(--color-text, #222)",
+      maxWidth: "min(92vw, 480px)",
+      padding: "20px",
+      width: "100%",
+      zIndex: "10000",
+    });
+
+    const title = document.createElement("strong");
+    title.textContent = options.title || options.message || "Message";
+    dialog.append(title);
+    if (options.title && options.message) {
+      const message = document.createElement("p");
+      message.textContent = options.message;
+      dialog.append(message);
+    }
+    if (options.detail) {
+      const detail = document.createElement("p");
+      detail.textContent = options.detail;
+      dialog.append(detail);
+    }
+
+    const actions = document.createElement("div");
+    Object.assign(actions.style, { display: "flex", gap: "8px", justifyContent: "flex-end", marginTop: "20px" });
+    const finish = (response: number): void => {
+      dialog.close();
+      dialog.remove();
+      resolve(response);
+    };
+    buttons.forEach((label, index) => {
+      const button = document.createElement("button");
+      button.textContent = label;
+      button.type = "button";
+      Object.assign(button.style, { border: "1px solid #9995", borderRadius: "6px", padding: "6px 12px" });
+      button.addEventListener("click", () => finish(index));
+      actions.append(button);
+      if (index === (options.defaultId ?? 0)) queueMicrotask(() => button.focus());
+    });
+    dialog.append(actions);
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      finish(cancelId);
+    });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
 export function emitRendererEvent(channel: string, args: unknown[]): void {
   const listeners = rendererListeners.get(channel);
   if (!listeners || listeners.size === 0) {
@@ -168,6 +235,38 @@ export function emitRendererEvent(channel: string, args: unknown[]): void {
 
 function handleIncomingMessage(message: MainToRendererMessage): void {
   if (message.type === "ipc-main-event") {
+    if (message.channel === "codex-web:message-box-request" && typeof message.args[0] === "string") {
+      const requestId = message.args[0];
+      const options = (message.args[1] ?? {}) as MessageBoxOptions;
+      void openMessageBox(options)
+        .then((response) => enqueueMessage({ type: "ipc-renderer-send", channel: "codex-web:message-box-result", args: [{ requestId, response }] }))
+        .catch((error) => {
+          console.error("[codex-web] message box failed", error);
+          enqueueMessage({ type: "ipc-renderer-send", channel: "codex-web:message-box-result", args: [{ requestId, response: options.cancelId ?? (options.buttons?.length ?? 1) - 1 }] });
+        });
+      return;
+    }
+    if (message.channel === "codex-web:menu-role" && typeof message.args[0] === "string") {
+      const role = message.args[0];
+      if (role === "paste") {
+        void navigator.clipboard.readText()
+          .then((value) => document.execCommand("insertText", false, value))
+          .catch((error) => console.error("[codex-web] paste failed", error));
+      } else if (["undo", "redo", "cut", "copy", "delete", "selectAll"].includes(role)) {
+        document.execCommand(role);
+      }
+      return;
+    }
+    if (message.channel === "codex-web:workspace-dialog-request" && typeof message.args[0] === "string") {
+      const requestId = message.args[0];
+      void openSelectWorkspaceRootDialog({ listDirectory: requestWorkspaceDirectoryEntries })
+        .then((path) => enqueueMessage({ type: "ipc-renderer-send", channel: "codex-web:workspace-dialog-result", args: [{ requestId, path }] }))
+        .catch((error) => {
+          console.error("[codex-web] workspace picker failed", error);
+          enqueueMessage({ type: "ipc-renderer-send", channel: "codex-web:workspace-dialog-result", args: [{ requestId, path: null }] });
+        });
+      return;
+    }
     emitRendererEvent(message.channel, message.args);
     return;
   }
@@ -449,17 +548,6 @@ export const ipcRenderer = {
         return handleLocalFilePickerMessage(args[0]);
       }
 
-      if (isUnhandledAddWorkspaceRootOptionMessage(args[0])) {
-        return openSelectWorkspaceRootDialog({
-          listDirectory: requestWorkspaceDirectoryEntries,
-        }).then((root) => {
-          if (!root) {
-            return undefined;
-          }
-
-          return invokeMain(channel, [{ ...args[0], root }]);
-        });
-      }
     }
 
     return invokeMain(channel, args);

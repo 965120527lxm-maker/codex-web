@@ -8,9 +8,11 @@ declare global {
 
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { parseArgs as parseCliArgs } from "node:util";
 import { WebSocket, WebSocketServer } from "ws";
 import Fastify from "fastify";
@@ -242,7 +244,7 @@ type IpcMainBridgeState = {
   sendToRenderer?: (
     webContentsId: number,
     message: MainToRendererMessage,
-  ) => void;
+  ) => boolean;
   handleRendererInvoke?: (
     channel: string,
     args: unknown[],
@@ -416,38 +418,44 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
   await app.register(fastifyMultipart, {
     limits: {
-      fileSize: Infinity,
+      fileSize: 64 * 1024 * 1024,
+      files: 10,
     },
   });
 
   const uploadRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "codex-web-uploads-"),
   );
+  app.addHook("onClose", async () => {
+    await fs.rm(uploadRoot, { recursive: true, force: true });
+  });
 
   app.post("/__backend/upload", async (request, reply) => {
     if (!request.isMultipart()) {
       return reply.code(400).send({ error: "expected multipart upload body" });
     }
 
-    const files = await Array.fromAsync(
-      (async function* () {
-        for await (const part of request.files()) {
-          const label = part.filename?.trim() || "upload";
-
-          const uploadedPath = path.join(uploadRoot, randomUUID());
-
-          await fs.writeFile(uploadedPath, await part.toBuffer());
-
-          yield {
-            label,
-            path: uploadedPath,
-            fsPath: uploadedPath,
-          };
-        }
-      })(),
-    );
-
-    return reply.send({ files });
+    const uploadedPaths: string[] = [];
+    try {
+      const files = await Array.fromAsync(
+        (async function* () {
+          for await (const part of request.files()) {
+            const label = part.filename?.trim() || "upload";
+            const uploadedPath = path.join(uploadRoot, randomUUID());
+            uploadedPaths.push(uploadedPath);
+            await pipeline(part.file, createWriteStream(uploadedPath, { flags: "wx", mode: 0o600 }));
+            yield { label, path: uploadedPath, fsPath: uploadedPath };
+          }
+        })(),
+      );
+      return reply.send({ files });
+    } catch (error) {
+      await Promise.allSettled(uploadedPaths.map((filePath) => fs.rm(filePath, { force: true })));
+      if (error && typeof error === "object" && "statusCode" in error && error.statusCode === 413) {
+        return reply.code(413).send({ error: "upload limit exceeded" });
+      }
+      throw error;
+    }
   });
 
   await app.register(fastifyStatic, {
@@ -456,9 +464,20 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
     decorateReply: false,
   });
 
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (
+      reply.statusCode === 200 &&
+      /^\/assets\/.*-[a-f0-9]{8,}\.(?:js|css)$/.test(request.url.split("?", 1)[0] ?? "")
+    ) {
+      reply.header("Cache-Control", "public, max-age=31536000, immutable");
+    }
+    return payload;
+  });
+
   await app.register(fastifyStatic, {
     root: path.resolve(__dirname, "../../scratch/asar/webview"),
     prefix: "/",
+    preCompressed: true,
   });
 
   app.get("/", async (_request, reply) => {
@@ -496,11 +515,13 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
       bridgeState.setRendererWindowFactory = resolve;
     },
   );
-  bridgeState.sendToRenderer = (webContentsId, message): void => {
+  bridgeState.sendToRenderer = (webContentsId, message): boolean => {
     const socket = rendererSockets.get(webContentsId);
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
+      return true;
     }
+    return false;
   };
 
   websocketServer.on("connection", (socket) => {
@@ -680,6 +701,13 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
 
   await app.listen({ host: options.host, port: options.port });
   console.log(`IPC bridge listening at ws://${options.host}:${options.port}`);
+
+  const stop = (): void => {
+    for (const client of websocketServer.clients) client.terminate();
+    void app.close().finally(() => process.exit(0));
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
 
   ensureElectronLikeProcessContext();
   installModuleAliasHook();

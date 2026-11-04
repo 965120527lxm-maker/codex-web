@@ -1,0 +1,10 @@
+--- a/.vite/build/main-CqEoQDOU.js
++++ b/.vite/build/main-CqEoQDOU.js
+@@ -154617,6 +154617,7 @@
+       : c.D(e);
+ }
+ function xYe(e, t) {
++  if (r.Li(e.id) && process.env.CODEX_WEB_DURABLE_SOCKS_PROXY) return process.env.CODEX_WEB_DURABLE_SOCKS_PROXY;
+   let n = new URL(t).hostname;
+   if (n !== `localhost` && n !== `127.0.0.1` && n !== `[::1]`)
+     return r.Li(e.id)
