@@ -465,11 +465,19 @@ async function startIpcBridgeServer(options: ServerOptions): Promise<void> {
   });
 
   app.addHook("onSend", async (request, reply, payload) => {
+    const assetPath = request.url.split("?", 1)[0] ?? "";
     if (
       reply.statusCode === 200 &&
-      /^\/assets\/.*-[a-f0-9]{8,}\.(?:js|css)$/.test(request.url.split("?", 1)[0] ?? "")
+      /^\/assets\/.*-[a-f0-9]{8,}\.(?:js|css)$/.test(assetPath)
     ) {
-      reply.header("Cache-Control", "public, max-age=31536000, immutable");
+      // This desktop bundle is patched in place while keeping its upstream name.
+      // Revalidate it on refresh so browser fixes are not stuck in an immutable cache.
+      reply.header(
+        "Cache-Control",
+        /^\/assets\/app-shared-[a-f0-9]{8,}\.js$/.test(assetPath)
+          ? "private, no-cache"
+          : "public, max-age=31536000, immutable",
+      );
     }
     return payload;
   });

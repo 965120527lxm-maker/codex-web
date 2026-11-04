@@ -1,0 +1,34 @@
+--- a/webview/assets/app-shared-8bd9d0399038.js
++++ b/webview/assets/app-shared-8bd9d0399038.js
+@@ -310895,16 +310895,10 @@
+     c;
+   try {
+     if (o) {
+-      let { appServices: t } = await Wf(
+-          async () => {
+-            let { appServices: e } = await import(`./rpc-f6f57972be0d.js`);
+-            return { appServices: e };
+-          },
+-          [],
+-          import.meta.url,
+-        ),
+-        n = typeof e == `string` ? e : await e;
+-      c = Promise.resolve(t.clipboard.writeText(n));
++      let n = typeof e == `string` ? e : await e;
++      c = ACe(n, i.body).then((copied) => {
++        if (!copied) throw new Error(`Browser clipboard write failed`);
++      });
+     } else if (e instanceof Promise) {
+       if (`write` in r.clipboard && typeof ClipboardItem < `u`) {
+         let t = e.then((e) => new Blob([e], { type: `text/plain` }));
+@@ -327230,7 +327224,9 @@
+     ae;
+   t[3] !== u || t[4] !== m || t[5] !== w
+     ? ((ae = (e) => {
+-        (ONi(u ?? m, e), w?.());
++        const copyResult = ONi(u ?? m, e);
++        w?.();
++        return copyResult;
+       }),
+       (t[3] = u),
+       (t[4] = m),
