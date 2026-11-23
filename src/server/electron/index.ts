@@ -784,6 +784,12 @@ const crashReporter = {
 };
 
 const net = {
+  // Electron's net module exposes this helper. The browser bridge does not
+  // have Electron's connectivity monitor, so report the host as online and
+  // let the actual WebSocket request determine reachability.
+  isOnline(): boolean {
+    return true;
+  },
   async fetch(input: string | URL, init?: RequestInit): Promise<Response> {
     // log("net.fetch", [input, init]);
     if (typeof globalThis.fetch === "function") {
